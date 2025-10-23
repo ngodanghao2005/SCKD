@@ -166,9 +166,7 @@ def main():
             
             print(f"Stage-2 [Epoch {e+1:3d}/{E2}] "
                 f"Total={stats['loss_total']:.4f} "
-                f"CE={stats['loss_ce']:.4f} "
-                f"Sup={stats['loss_sup']:.4f} "
-                f"Unl={stats['loss_unl']:.4f} "
+                f"CE={stats['loss_ce_total']:.4f} "
                 f"K2N={stats['loss_k2n']:.4f} "
                 f"N2K={stats['loss_n2k']:.4f}")
             
@@ -212,9 +210,7 @@ def main():
             
             print(f"Stage-2 [Epoch {e+1:3d}/{E2}] "
                 f"Total={stats['loss_total']:.4f} "
-                f"CE={stats['loss_ce']:.4f} "
-                f"Sup={stats['loss_sup']:.4f} "
-                f"Unl={stats['loss_unl']:.4f} "
+                f"CE={stats['loss_ce_total']:.4f} "
                 f"K2N={stats['loss_k2n']:.4f} "
                 f"N2K={stats['loss_n2k']:.4f}")
             
