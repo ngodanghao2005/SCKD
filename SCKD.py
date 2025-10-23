@@ -103,10 +103,7 @@ class SCKDModel(nn.Module):
         f = self.encoder(x)                       # (B, 512): feature vector từ ResNet18
         l = self.hl(f)                            # (B, C_l): logits cho known classes
         u = self.hu(f)                            # (B, C_u): logits cho novel classes
-        
-        logits = torch.cat([l, u], dim=1)         # (B, C_l + C_u): gộp logits cả known và novel
-        logits = F.softmax(logits / self.tau, dim=-1)    # Soft Probability Distribution với softmax temperature = self.tau
-        return f, l, u, logits
+        return f, l, u
 
 # ============================
 # 4) Utils
@@ -169,14 +166,17 @@ class SCKDLoss(nn.Module):
                 x_l: torch.Tensor, y_l: torch.Tensor,
                 x_u: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
         # Forward
-        f_l, lhl, lhu, _ = model(x_l)  # labeled pass
-        f_u, uhl, uhu, _ = model(x_u)  # unlabeled pass
+        f_l, lhl, lhu = model(x_l)  # labeled pass
+        f_u, uhl, uhu = model(x_u)  # unlabeled pass
+
+        l_full = torch.cat([lhl, lhu], dim=1) # (N, Ck + Cn)
+        u_full = torch.cat([uhl, uhu], dim=1) # (M, Ck + Cn)
+        log_p_full = F.log_softmax(torch.cat([l_full, u_full], dim=0), dim=1) # (N+M, Ck + Cn)
         
         N = x_l.size(0)  # số labeled samples
         M = x_u.size(0)  # số unlabeled samples
-
-        # 1) Supervised CE on labeled (known classes)
-        loss_sup = F.cross_entropy(lhl, y_l)
+        Ck = lhl.size(1)
+        Cn = uhu.size(1)
 
         # 2) Replica features (frozen Er) - CHỈ cho labeled samples
         with torch.no_grad():
@@ -220,6 +220,11 @@ class SCKDLoss(nn.Module):
         # print("uhu output range:", uhu.min().item(), uhu.max().item())
         # # print("Sinkhorn output sum per sample:", pseudo.sum(dim=1))
         # print("uhu output sample:", uhu[0])  # Xem distribution của sample đầu tiên
+        
+        # Nhãn mục tiêu cho Known Samples: One-Hot (Ck) + Zeros (Cn)
+        y_l_onehot = F.one_hot(y_l, num_classes=Ck) # (N, Ck)
+        y_l_full = torch.cat([y_l_onehot, torch.zeros(N, Cn, device=y_l.device)], dim=1)  # (N, Ck + Cn)
+        # loss_sup = F.cross_entropy(lhl, y_l_full.argmax(dim=1))  # supervised CE loss on known head
 
         # 6) Pseudo-label CE on unlabeled via Sinkhorn from novel-head
         with torch.no_grad():
@@ -244,8 +249,11 @@ class SCKDLoss(nn.Module):
         #     reduction='batchmean'
         # )
         
-        log_probs = F.log_softmax(uhu, dim=1)       # Tính log probability của model
-        loss_unl = (- (pseudo * log_probs).sum(dim=1)).mean()  # CE với pseudo-labels từ Sinkhorn
+        y_u_full = torch.cat([torch.zeros(M, Ck, dtype=pseudo.dtype, device=pseudo.device), pseudo], dim=1) # (M, Ck + Cn)
+        y_full = torch.cat([y_l_full, y_u_full], dim=0) # (N+M, Ck + Cn)
+        
+        # log_probs = F.log_softmax(uhu, dim=1)       # Tính log probability của model
+        # loss_unl = (- (pseudo * log_probs).sum(dim=1)).mean()  # CE với pseudo-labels từ Sinkhorn
         
         # loss_unl = F.kl_div(
         #     F.log_softmax(uhu, dim=1),
@@ -259,14 +267,12 @@ class SCKDLoss(nn.Module):
             # loss_unl = torch.mean(torch.sum(-pseudo * F.log_softmax(uhu, dim=1), dim=1))
 
         # Aggregate
-        loss_ce = (loss_sup * N + loss_unl * M) / (N + M)
-        loss_total = loss_ce + self.beta * (loss_k2n + loss_n2k)
+        loss_ce_total = -torch.sum(y_full * log_p_full) / (N + M)
+        loss_total = loss_ce_total + self.beta * (loss_k2n + loss_n2k)
 
         stats = {
             "loss_total": float(loss_total.item()),
-            "loss_ce": float(loss_ce.item()),
-            "loss_sup": float(loss_sup.item()),
-            "loss_unl": float(loss_unl.item()),
+            "loss_ce_total": float(loss_ce_total.item()),
             "loss_k2n": float(loss_k2n.item()),
             "loss_n2k": float(loss_n2k.item()),
         }
@@ -339,7 +345,7 @@ def stage1_supervised_epoch(model: SCKDModel, loader_labeled, optimizer, device:
     for x, y in loader_labeled:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        _, lhl, _, _ = model(x)
+        _, lhl, _ = model(x)
         loss = F.cross_entropy(lhl, y)
         loss.backward()
         optimizer.step()
@@ -391,7 +397,7 @@ def evaluate_task_aware(model: SCKDModel, loader_unlabeled, num_novel_classes: i
 
     for x_u, y_u in loader_unlabeled:
         x_u, y_u = x_u.to(device), y_u.to(device)
-        _, _, uhu, _ = model(x_u)   # lấy logits từ Novel-Class Head
+        _, _, uhu = model(x_u)   # lấy logits từ Novel-Class Head
         pseudo = sinkhorn(uhu.detach(), n_iter=sinkhorn_iter, eps=sinkhorn_eps)
         pred = pseudo.argmax(1)
         # print(pred)
