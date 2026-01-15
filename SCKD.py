@@ -1,19 +1,3 @@
-"""
-SCKD (reworked)
-- Two-stage training (Supervised -> Discovery)
-- Frozen replica encoder Er after stage-1
-- Bidirectional distillation (L_k->n and L_n->k)
-- Similarity preservation w.r.t. Er
-- Sinkhorn pseudo-labeling on unlabeled
-- Backbones: ResNet-18 (CIFAR/IN100) and ViT-B/16 (DINO) for fine-grained
-- Optional: ViT fine-tune last block only
-
-Notes
------
-This file focuses on model, loss, and a reference training loop skeleton.
-You still need to plug in your DataLoaders (x_l, y_l) and (x_u) per batch.
-"""
-
 from __future__ import annotations
 import copy, math, torch, torch.nn as nn, torch.nn.functional as F
 from typing import Dict, Tuple
@@ -24,7 +8,7 @@ from torchvision import datasets, transforms
 import numpy as np
 from sklearn.metrics import confusion_matrix
 from scipy.optimize import linear_sum_assignment
-# import timm
+from sklearn.cluster import KMeans
 
 # ============================
 # 1) Encoders
@@ -52,17 +36,6 @@ class Encoder(nn.Module):
         if self.backbone_name == "resnet18":
             f = f.view(f.size(0), -1)
         return f
-
-    # def finetune_last_block_only(self):
-    #     """For ViT, freeze all but the last block (and pos_embed/cls/head if needed).
-    #     For ResNet, no-op.
-    #     """
-    #     if self.backbone_name != "vit_b16_dino":
-    #         return
-    #     for name, p in self.encoder.named_parameters():
-    #         # unfreeze last block (blocks.11) and norm/ln after it
-    #         trainable = ("blocks.11" in name) or ("norm" in name) or ("head" in name)
-    #         p.requires_grad = trainable
 
 # ============================
 # 2) Heads
@@ -99,10 +72,14 @@ class SCKDModel(nn.Module):
         self.hu = NovelHead(encoder.out_dim, cu)
         self.tau = tau
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         f = self.encoder(x)                       # (B, 512): feature vector từ ResNet18
         l = self.hl(f)                            # (B, C_l): logits cho known classes
         u = self.hu(f)                            # (B, C_u): logits cho novel classes
+        combined = torch.cat([l, u], dim=1)
+        combined_norm = F.normalize(combined, p=2, dim=1) * 10.0  # chuẩn hóa và scale
+        l = combined_norm[:, :self.hl.fc.out_features] 
+        u = combined_norm[:, self.hl.fc.out_features:]
         return f, l, u
 
 # ============================
@@ -120,161 +97,122 @@ def cosine_matrix(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 def normalize_absmax(S: torch.Tensor) -> torch.Tensor:
     return S / (S.abs().max() + 1e-12)
 
-# @torch.no_grad()
-# def sinkhorn(logits: torch.Tensor, n_iter: int = 3, eps: float = 0.05) -> torch.Tensor:
-#     Q = torch.exp(logits / eps).t()  # (C, B)
-#     B, C = Q.shape[1], Q.shape[0]
-#     Q /= Q.sum()
-#     r = torch.ones(C, device=Q.device) / C
-#     c = torch.ones(B, device=Q.device) / B
-#     for _ in range(n_iter):
-#         Q *= (r / Q.sum(1)).unsqueeze(1)
-#         Q *= (c / Q.sum(0)).unsqueeze(0)
-#     return (Q / Q.sum(0, keepdim=True)).t()  # (B, C)
 @torch.no_grad()
-def sinkhorn(logits: torch.Tensor, n_iter: int = 5, eps: float = 0.35) -> torch.Tensor:
+def sinkhorn(logits: torch.Tensor, n_iter: int = 5, eps: float = 0.05) -> torch.Tensor:
     # ổn định số học trước khi exp
     logits = logits - logits.max(dim=1, keepdim=True)[0]
     Q = torch.exp(logits / eps).t()  # (C, B)
     B, C = Q.shape[1], Q.shape[0]
 
-    r = torch.ones(C, device=Q.device) / C
-    c = torch.ones(B, device=Q.device) / B
+    c = torch.ones(C, device=Q.device) / C
+    r = torch.ones(B, device=Q.device) / B
 
     for _ in range(n_iter):
         Q /= Q.sum(1, keepdim=True) + 1e-12
-        Q *= r.unsqueeze(1)
+        Q *= c.unsqueeze(1)
         Q /= Q.sum(0, keepdim=True) + 1e-12
-        Q *= c.unsqueeze(0)
+        Q *= r.unsqueeze(0)
 
     return (Q / (Q.sum(0, keepdim=True) + 1e-12)).t()  # (B, C)
+
+def cdc_loss(uhu, lhu, S, alpha, T=1.0):
+    # 1. Tính xác suất từ Novel-head cho các mẫu Unlabeled (Dự đoán thực tế)
+    p_u = F.softmax(uhu / T, dim=1)  # [Bu, Cn]
+    
+    # 2. Tổng hợp "Tri thức từ Known" để tạo mục tiêu cho Novel (Giả nhãn mềm)
+    with torch.no_grad():
+        lhat_u_logits = alpha * torch.matmul(S.t(), lhu.detach())
+        q_u = F.softmax(lhat_u_logits / T, dim=1)  # [Bu, Cn]
+
+    # 3. Xây dựng ma trận tương đồng cặp (Pairwise Similarity) theo PCR
+    # Ma trận U: Mối quan hệ giữa các mẫu do Novel-head tự cảm nhận
+    # Ma trận V: Mối quan hệ giữa các mẫu được dẫn dắt bởi Known-space
+    U = torch.matmul(p_u, p_u.t())  # [Bu, Bu]
+    V = torch.matmul(q_u, q_u.t())  # [Bu, Bu]
+
+    # 4. Tính KL Divergence trên ma trận tương đồng (CDC Loss)
+    loss_cdc = F.kl_div(
+        F.log_softmax(U, dim=1), 
+        F.softmax(V, dim=1), 
+        reduction='batchmean'
+    ) * (T * T)
+
+    return loss_cdc
 
 # ============================
 # 5) Loss: Bidirectional Distillation + CE + Similarity Pres.
 # ============================
 class SCKDLoss(nn.Module):
-    def __init__(self, alpha: float = 0.1, beta: float = 0.5, distill_temp: float = 1.0,
-                 sinkhorn_iter: int = 5, sinkhorn_eps: float = 0.35):
+    def __init__(self, alpha: float = 0.1, beta: float = 0.5, gamma: float = 0.5, distill_temp: float = 0.1):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
         self.distill_temp = distill_temp
-        self.sinkhorn_iter = sinkhorn_iter
-        self.sinkhorn_eps = sinkhorn_eps
 
-    def forward(self, model: SCKDModel, Er: Encoder,
-                x_l: torch.Tensor, y_l: torch.Tensor,
-                x_u: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def forward(self, model, Er, x_l, y_l, x_u, u_idx, global_labels) -> Tuple[torch.Tensor, Dict[str, float]]:
         # Forward
         f_l, lhl, lhu = model(x_l)  # labeled pass
         f_u, uhl, uhu = model(x_u)  # unlabeled pass
 
-        l_full = torch.cat([lhl, lhu], dim=1) # (N, Ck + Cn)
-        u_full = torch.cat([uhl, uhu], dim=1) # (M, Ck + Cn)
-        log_p_full = F.log_softmax(torch.cat([l_full, u_full], dim=0), dim=1) # (N+M, Ck + Cn)
+        # l_full = torch.cat([lhl, lhu], dim=1) # (N, Ck + Cn)
+        # u_full = torch.cat([uhl, uhu], dim=1) # (M, Ck + Cn)
+        # full = torch.cat([l_full, u_full], dim=0) / self.distill_temp # (N+M, Ck + Cn)
+        # log_p_full = F.log_softmax(full, dim=1) # (N+M, Ck + Cn)
         
-        N = x_l.size(0)  # số labeled samples
-        M = x_u.size(0)  # số unlabeled samples
-        Ck = lhl.size(1)
-        Cn = uhu.size(1)
+        N = x_l.size(0)
+        M = x_u.size(0)
 
-        # 2) Replica features (frozen Er) - CHỈ cho labeled samples
         with torch.no_grad():
             vl = Er(x_l)  # replica features for labeled samples only
-            
-        # print("vl stats:", vl.mean().item(), vl.std().item())
-        # print("f_u stats:", f_u.mean().item(), f_u.std().item())
 
-        # 3) Cross-group similarity between (vl) and (current f_u) to bridge spaces
-        S = normalize_absmax(cosine_matrix(vl, f_u))  # (Bl, Bu)
-        
-        # print("Similarity matrix - Min:", S.min().item(), "Max:", S.max().item(), "Mean:", S.mean().item())
+        # Cross-group similarity between (vl) and (current f_u) to bridge spaces
+        S = normalize_absmax(cosine_matrix(vl, f_u))
 
-        # 4) k->n distillation: sử dụng logits thay vì one-hot
+        # k->n distillation: sử dụng logits thay vì one-hot
         with torch.no_grad():
             lhu_logits = lhu.detach()
 
-        lhat_u = self.alpha * (S.t() @ lhu_logits)  # (Bu, Cn)
-        lhat_u = F.softmax(lhat_u / self.distill_temp, dim=1)
+        lhat_u = self.alpha * (S.t() @ lhu_logits)
+        lhat_u = F.softmax(lhat_u / 1.0, dim=1)
         
-        # KL( known-head on x_u || soft targets from labeled )
         loss_k2n = F.kl_div(
-            F.log_softmax(uhu / self.distill_temp, dim=1),
+            F.log_softmax(uhu / 1.0, dim=1),
             lhat_u,
             reduction='batchmean'
         )
 
-        # 5) n->k distillation: sử dụng logits
+        loss_cdc = cdc_loss(uhu, lhu, S, self.alpha, T=1.0)
+
+        # n->k distillation: sử dụng logits
         with torch.no_grad():
-            uhl_logits = uhl.detach()  # (Bu, Ck) - logits từ known head trên unlabeled
+            uhl_logits = uhl.detach()
             
-        lhat_l = self.alpha * (S @ uhl_logits)  # (Bl, Ck)
-        lhat_l = F.softmax(lhat_l / self.distill_temp, dim=1)
+        lhat_l = self.alpha * (S @ uhl_logits)
+        lhat_l = F.softmax(lhat_l / 1.0, dim=1)
         
         loss_n2k = F.kl_div(
-            F.log_softmax(lhl / self.distill_temp, dim=1),
+            F.log_softmax(lhl / 1.0, dim=1),
             lhat_l,
             reduction='batchmean'
         )
-
-        # print("uhu output range:", uhu.min().item(), uhu.max().item())
-        # # print("Sinkhorn output sum per sample:", pseudo.sum(dim=1))
-        # print("uhu output sample:", uhu[0])  # Xem distribution của sample đầu tiên
         
-        # Nhãn mục tiêu cho Known Samples: One-Hot (Ck) + Zeros (Cn)
-        y_l_onehot = F.one_hot(y_l, num_classes=Ck) # (N, Ck)
-        y_l_full = torch.cat([y_l_onehot, torch.zeros(N, Cn, device=y_l.device)], dim=1)  # (N, Ck + Cn)
-        # loss_sup = F.cross_entropy(lhl, y_l_full.argmax(dim=1))  # supervised CE loss on known head
-
-        # 6) Pseudo-label CE on unlabeled via Sinkhorn from novel-head
-        with torch.no_grad():
-            pseudo = sinkhorn(uhu.detach(), n_iter=self.sinkhorn_iter, eps=self.sinkhorn_eps)
-        #     y_u_hat = pseudo.argmax(dim=1)
-        # loss_unl = F.cross_entropy(uhu, y_u_hat)
+        # Tính toán Cross-Entropy cho cả hai tập
+        # Unlabeled CE dùng nhãn từ K-means
         
-        all_preds = []
-        print("Sinkhorn output range:", pseudo.min().item(), pseudo.max().item())
-        # print("Sinkhorn output sum per sample:", pseudo.sum(dim=1))
-        print("Sinkhorn output sample:", pseudo[0])  # Xem distribution của sample đầu tiên
-        all_preds.extend(pseudo.argmax(dim=1).cpu().tolist())
-        all_preds = np.array(all_preds)
-        print("counts preds:", {k:int((all_preds==k).sum()) for k in np.unique(all_preds)})
-        print()
+        loss_ce_u = F.cross_entropy(uhu / self.distill_temp, global_labels[u_idx])
+        loss_ce_l = F.cross_entropy(lhl / self.distill_temp, y_l)
         
-        # entropy = - (pseudo * torch.log(pseudo + 1e-12)).sum(dim=1).mean()
-        
-        # loss_unl = F.kl_div(
-        #     F.log_softmax(uhu, dim=1),
-        #     pseudo,
-        #     reduction='batchmean'
-        # )
-        
-        y_u_full = torch.cat([torch.zeros(M, Ck, dtype=pseudo.dtype, device=pseudo.device), pseudo], dim=1) # (M, Ck + Cn)
-        y_full = torch.cat([y_l_full, y_u_full], dim=0) # (N+M, Ck + Cn)
-        
-        # log_probs = F.log_softmax(uhu, dim=1)       # Tính log probability của model
-        # loss_unl = (- (pseudo * log_probs).sum(dim=1)).mean()  # CE với pseudo-labels từ Sinkhorn
-        
-        # loss_unl = F.kl_div(
-        #     F.log_softmax(uhu, dim=1),
-        #     pseudo,
-        #     reduction='batchmean'
-        # )
-        # ) - 0.1 * entropy
-        
-        # print(f"Pseudo-label entropy: {entropy.item():.4f}")
-        # print()
-            # loss_unl = torch.mean(torch.sum(-pseudo * F.log_softmax(uhu, dim=1), dim=1))
-
-        # Aggregate
-        loss_ce_total = -torch.sum(y_full * log_p_full) / (N + M)
-        loss_total = loss_ce_total + self.beta * (loss_k2n + loss_n2k)
+        # N và M là batch_size của từng tập
+        loss_ce_total = (loss_ce_l * N + loss_ce_u * M) / (N + M)
+        loss_total = loss_ce_total + self.beta * (loss_k2n + loss_n2k) + self.gamma * loss_cdc
 
         stats = {
             "loss_total": float(loss_total.item()),
             "loss_ce_total": float(loss_ce_total.item()),
             "loss_k2n": float(loss_k2n.item()),
             "loss_n2k": float(loss_n2k.item()),
+            "loss_cdc": float(loss_cdc.item())
         }
         return loss_total, stats
 
@@ -283,13 +221,12 @@ class SCKDLoss(nn.Module):
 # ============================
 def get_optimizer_scheduler(model: SCKDModel, mode: str, cfg: Dict, total_epochs: int):
     if mode == "cifar":
-        base_lr = cfg.get('lr', 0.4)          # đỉnh: 0.4
-        min_lr  = cfg.get('min_lr', 1e-3)     # đáy: 0.001
+        base_lr = cfg.get('lr')
+        min_lr  = cfg.get('min_lr')
         warmup  = cfg.get('warmup_epochs', 10)
         momentum, weight_decay = 0.9, 1.5e-4  # theo paper
 
         opt = SGD(model.parameters(), lr=base_lr, momentum=momentum, weight_decay=weight_decay)
-        # start_factor = min_lr / base_lr       # 0.001 / 0.4 = 0.0025
         step = (base_lr - min_lr) / (warmup - 1)
         def lr_lambda(epoch):
             if epoch < warmup:
@@ -313,6 +250,7 @@ def get_optimizer_scheduler(model: SCKDModel, mode: str, cfg: Dict, total_epochs
     #         t = (epoch - warmup) / max(1, total_epochs - warmup)
     #         return (min_lr / base_lr) + (1.0 - (min_lr / base_lr)) * 0.5 * (1 + math.cos(math.pi * t))
     #     sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+    
     return opt, sched
 
 # ============================
@@ -341,8 +279,8 @@ def clone_frozen_replica(encoder: Encoder) -> Encoder:
 
 def stage1_supervised_epoch(model: SCKDModel, loader_labeled, optimizer, device: str = "cuda") -> Dict[str, float]:
     model.train()
-    total, correct, loss_accum, n = 0, 0, 0.0, 0
-    for x, y in loader_labeled:
+    correct, loss_accum, n = 0, 0.0, 0
+    for x, y, _ in loader_labeled:
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         _, lhl, _ = model(x)
@@ -355,54 +293,64 @@ def stage1_supervised_epoch(model: SCKDModel, loader_labeled, optimizer, device:
         n += x.size(0)
     return {"sup_loss": loss_accum / max(1, n), "sup_acc": correct / max(1, n)}
 
+@torch.no_grad()
+def run_global_estep(model, loader, num_clusters, device):
+    model.eval()
+    all_features = []
+    # Loader này không cần shuffle, dùng để quét toàn bộ tập Unlabeled
+    for x, _, _ in loader:
+        f, _, _ = model(x.to(device))
+        all_features.append(f.cpu())
+    
+    all_features = torch.cat(all_features, dim=0)
+    all_features = F.normalize(all_features, p=2, dim=1)
+    all_features = all_features.numpy()
+    # Phân cụm dựa trên đặc trưng hiện tại của Encoder
+    
+    kmeans = KMeans(n_clusters=num_clusters, n_init=10, random_state=42)
+    labels = kmeans.fit_predict(all_features)
+    return torch.from_numpy(labels).long().to(device)
 
 def stage2_discovery_epoch(model: SCKDModel, Er: Encoder, loader_labeled, loader_unlabeled,
-                           optimizer, criterion: SCKDLoss, device: str = "cuda") -> Dict[str, float]:
+                           optimizer, criterion: SCKDLoss, global_labels: torch.Tensor, device: str = "cuda") -> Dict[str, float]:
     model.train()
     it_u = iter(loader_unlabeled)
     stats_accum: Dict[str, float] = {}
     count = 0
-    for x_l, y_l in loader_labeled:
+    for x_l, y_l, _ in loader_labeled:
         try:
-            x_u = next(it_u)
+            x_u, _, u_idx = next(it_u)
         except StopIteration:
             it_u = iter(loader_unlabeled)
-            x_u = next(it_u)
-        if isinstance(x_u, (list, tuple)):
-            x_u = x_u[0]
-        x_l, y_l, x_u = x_l.to(device), y_l.to(device), x_u.to(device)
-        
-        if count == 0:  # Chỉ in batch đầu tiên
-            print("Batch - Labeled classes:", torch.unique(y_l))
-            print("Batch - Labeled class distribution:", torch.bincount(y_l))
+            x_u, _, u_idx = next(it_u)
+        # if isinstance(x_u, (list, tuple)):
+        #     x_u = x_u[0]
+        x_l, y_l, x_u, u_idx = x_l.to(device), y_l.to(device), x_u.to(device), u_idx.to(device)
 
         optimizer.zero_grad(set_to_none=True)
-        loss, stats = criterion(model, Er, x_l, y_l, x_u)
+        loss, stats = criterion(model, Er, x_l, y_l, x_u, u_idx, global_labels)
+        
         loss.backward()
         optimizer.step()
 
         for k, v in stats.items():
             stats_accum[k] = stats_accum.get(k, 0.0) + v
         count += 1
-
+    
     for k in list(stats_accum.keys()):
         stats_accum[k] /= max(1, count)
     return stats_accum
 
 @torch.no_grad()
-def evaluate_task_aware(model: SCKDModel, loader_unlabeled, num_novel_classes: int, device: str = "cuda",
-                        sinkhorn_iter: int = 5, sinkhorn_eps: float = 0.35) -> Dict[str, float]:
+def evaluate_training_subset(model: SCKDModel, loader_unlabeled, num_novel_classes: int, device: str = "cuda") -> Dict[str, float]:
     model.eval()
     all_preds, all_targets = [], []
 
-    for x_u, y_u in loader_unlabeled:
+    for x_u, y_u, _ in loader_unlabeled:
         x_u, y_u = x_u.to(device), y_u.to(device)
-        _, _, uhu = model(x_u)   # lấy logits từ Novel-Class Head
-        pseudo = sinkhorn(uhu.detach(), n_iter=sinkhorn_iter, eps=sinkhorn_eps)
-        pred = pseudo.argmax(1)
-        # print(pred)
-        # print(y_u)
-        # print()
+        _, _, uhu = model(x_u)
+
+        pred = uhu.argmax(1)
 
         all_preds.extend(pred.cpu().tolist())
         all_targets.extend(y_u.cpu().tolist())
@@ -413,55 +361,53 @@ def evaluate_task_aware(model: SCKDModel, loader_unlabeled, num_novel_classes: i
     min_label = min(all_targets)
     all_targets_mapped = all_targets - min_label
     
-    print("unique targets:", np.unique(all_targets))
-    print("unique preds:", np.unique(all_preds))
-    print("counts targets:", {k:int((all_targets==k).sum()) for k in np.unique(all_targets)})
-    print("counts preds:", {k:int((all_preds==k).sum()) for k in np.unique(all_preds)})
-
-    # === Hungarian matching ===
-    # --- REMAP ground-truth novel labels to 0..Cu-1 ---
-    # uniq_targets = np.unique(all_targets)
-    # # if they are contiguous like [5,6,7,8,9], this will map to 0..4 by subtracting min
-    # if np.array_equal(uniq_targets, np.arange(uniq_targets.min(), uniq_targets.min() + uniq_targets.size)):
-    #     all_targets_mapped = all_targets - uniq_targets.min()
-    # else:
-    #     # general mapping
-    #     mapping = {int(v): i for i, v in enumerate(uniq_targets)}
-    #     all_targets_mapped = np.array([mapping[int(v)] for v in all_targets])
-
-    # Cu = len(np.unique(all_preds))  # or set Cu manually
-    # cm = confusion_matrix(all_targets_mapped, all_preds, labels=np.arange(Cu))
     cm = confusion_matrix(all_targets_mapped, all_preds, labels=np.arange(num_novel_classes))
-    # n_true, n_pred = cm.shape
-    # if n_pred != n_true:
-    #     # Pad ma trận để thành vuông
-    #     size = max(n_pred, n_true)
-    #     padded = np.zeros((size, size), dtype=np.int64)
-    #     padded[:n_true, :n_pred] = cm
-    #     cm = padded
     
     row_ind, col_ind = linear_sum_assignment(-cm)
     acc = cm[row_ind, col_ind].sum() / cm.sum()
     return {"acc_unlabeled": acc}
 
-# ============================
-# 9) Example high-level train() wrapper (pseudo)
-# ============================
-"""
-Example usage (you must provide DataLoaders):
+@torch.no_grad()
+def evaluate_testing_subset(model: SCKDModel, loader_test_known, loader_test_novel, 
+                            Ck, Cn, device: str = "cuda") -> Dict[str, float]:
+    model.eval()
+    all_preds_full, all_targets_full = [], []
 
-model = build_model(mode, cl, cu, device)
-opt1, sch1 = get_optimizer_scheduler(model, mode, cfg_stage1, total_epochs=E1)
-for e in range(E1):
-    m = stage1_supervised_epoch(model, loader_labeled, opt1, device)
-    sch1.step()
+    for loader in [loader_test_known, loader_test_novel]:
+        for x, y_true, _ in loader:
+            x = x.to(device)
+            _, hl, hu = model(x)
+            
+            # hl đã được qua Logit Norm trong model (nếu bạn đã sửa forward)
+            logits_full = torch.cat([hl, hu], dim=1) 
+            pred_full = logits_full.argmax(1) 
+            
+            all_preds_full.extend(pred_full.cpu().tolist())
+            all_targets_full.extend(y_true.tolist())
 
-Er = clone_frozen_replica(model.encoder)  # freeze replica after stage-1
+    all_preds_full = np.array(all_preds_full)
+    all_targets_full = np.array(all_targets_full)
 
-criterion = SCKDLoss(alpha=0.1, beta=0.5, distill_temp=1.0,
-                     sinkhorn_iter=3, sinkhorn_eps=0.05)
-opt2, sch2 = get_optimizer_scheduler(model, mode, cfg_stage2, total_epochs=E2)
-for e in range(E2):
-    stats = stage2_discovery_epoch(model, Er, loader_labeled, loader_unlabeled, opt2, criterion, device)
-    sch2.step()
-"""
+    cm = confusion_matrix(all_targets_full, all_preds_full, labels=np.arange(Ck + Cn))
+    
+    row_ind, col_ind = linear_sum_assignment(-cm[Ck:, Ck:])
+
+    idx_map = {c + Ck: r + Ck for r, c in zip(row_ind, col_ind)}
+
+    for i in range(Ck):
+        idx_map[i] = i
+        
+    mapped_preds = np.array([idx_map.get(p, p) for p in all_preds_full])
+
+    is_known = (all_targets_full < Ck)
+    is_novel = (all_targets_full >= Ck)
+
+    acc_known = np.mean(mapped_preds[is_known] == all_targets_full[is_known])
+    acc_novel = np.mean(mapped_preds[is_novel] == all_targets_full[is_novel])
+    acc_overall = np.mean(mapped_preds == all_targets_full)
+
+    return {
+        "Acc_Known_Classes": float(acc_known), 
+        "Clustering_Acc_Novel_Classes": float(acc_novel), 
+        "Acc_Overall": float(acc_overall)
+    }
