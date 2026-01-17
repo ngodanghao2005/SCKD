@@ -97,24 +97,6 @@ def cosine_matrix(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
 def normalize_absmax(S: torch.Tensor) -> torch.Tensor:
     return S / (S.abs().max() + 1e-12)
 
-@torch.no_grad()
-def sinkhorn(logits: torch.Tensor, n_iter: int = 5, eps: float = 0.05) -> torch.Tensor:
-    # ổn định số học trước khi exp
-    logits = logits - logits.max(dim=1, keepdim=True)[0]
-    Q = torch.exp(logits / eps).t()  # (C, B)
-    B, C = Q.shape[1], Q.shape[0]
-
-    c = torch.ones(C, device=Q.device) / C
-    r = torch.ones(B, device=Q.device) / B
-
-    for _ in range(n_iter):
-        Q /= Q.sum(1, keepdim=True) + 1e-12
-        Q *= c.unsqueeze(1)
-        Q /= Q.sum(0, keepdim=True) + 1e-12
-        Q *= r.unsqueeze(0)
-
-    return (Q / (Q.sum(0, keepdim=True) + 1e-12)).t()  # (B, C)
-
 def cdc_loss(uhu, lhu, S, alpha, T=1.0):
     # 1. Tính xác suất từ Novel-head cho các mẫu Unlabeled (Dự đoán thực tế)
     p_u = F.softmax(uhu / T, dim=1)  # [Bu, Cn]
@@ -411,3 +393,4 @@ def evaluate_testing_subset(model: SCKDModel, loader_test_known, loader_test_nov
         "Clustering_Acc_Novel_Classes": float(acc_novel), 
         "Acc_Overall": float(acc_overall)
     }
+
